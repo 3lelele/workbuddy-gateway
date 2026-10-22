@@ -162,10 +162,18 @@ func TestOfficialHeadersModelOnlyAndInternationalFallback(t *testing.T) {
 				len(req.Header.Get("X-Request-ID")) != 32 {
 				t.Fatal("observed desktop header contract not met")
 			}
-			for _, name := range []string{"Origin", "Referer", "X-Client-ID", "X-Refresh-Token",
-				"X-Device-Token", "X-Stainless-Runtime-Version", "X-Agent-Purpose"} {
+			for _, name := range []string{"Origin", "Referer", "X-Client-ID", "X-Refresh-Token", "X-Device-Token"} {
 				if req.Header.Get(name) != "" {
 					t.Fatalf("unexpected header %s", name)
+				}
+			}
+			for name, want := range map[string]string{
+				"X-Requested-With": "XMLHttpRequest", "x-stainless-runtime": "node",
+				"x-stainless-runtime-version": "v22.21.1", "X-Agent-Intent": "craft",
+				"X-Agent-Purpose": "conversation", "X-Agent-Type": "main", "X-Product": "SaaS",
+			} {
+				if got := req.Header.Get(name); got != want {
+					t.Fatalf("header %s=%q want %q", name, got, want)
 				}
 			}
 			if req.Header.Get("Authorization") != "Bearer synthetic-access" {

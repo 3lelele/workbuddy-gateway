@@ -196,14 +196,31 @@ func applyObservedDesktopHeaders(req *http.Request, prof *upstreamProfile, profi
 	} {
 		req.Header.Del(name)
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", observedDesktopUA)
-	req.Header.Set("X-IDE-Type", "WorkBuddy")
-	req.Header.Set("X-IDE-Name", "WorkBuddy")
-	req.Header.Set("X-IDE-Version", "5.8.3")
-	req.Header.Set("X-Private-Data", "true")
-	// Agent 用途随主请求/标题/子任务变化；没有可靠元数据时不把所有调用冒充 main。
-	req.Header.Set("X-Codebuddy-Request", "1")
+	// 2026-10-21 国内桌面实抓的静态客户端身份。设备令牌、用户身份和会话标识
+	// 仍由真实账号/会话提供；不伪造无法取得的 X-Device-Token。
+	for name, value := range map[string]string{
+		"Accept":                      "application/json",
+		"User-Agent":                  observedDesktopUA,
+		"X-Requested-With":            "XMLHttpRequest",
+		"x-stainless-arch":            "x64",
+		"x-stainless-lang":            "js",
+		"x-stainless-os":              "Windows",
+		"x-stainless-package-version": "6.25.0",
+		"x-stainless-retry-count":     "0",
+		"x-stainless-runtime":         "node",
+		"x-stainless-runtime-version": "v22.21.1",
+		"X-IDE-Type":                  "WorkBuddy",
+		"X-IDE-Name":                  "WorkBuddy",
+		"X-IDE-Version":               "5.8.3",
+		"X-Private-Data":              "true",
+		"X-Codebuddy-Request":         "1",
+		"X-Agent-Intent":              "craft",
+		"X-Agent-Purpose":             "conversation",
+		"X-Agent-Type":                "main",
+		"X-Product":                   "SaaS",
+	} {
+		req.Header.Set(name, value)
+	}
 	// 保持同一逻辑请求的 message/request ID 相等；重试沿用，不改变本地审计 TraceID。
 	message := strings.ReplaceAll(req.Header.Get(conversationMessageIDHeader), "-", "")
 	req.Header.Set(conversationMessageIDHeader, message)

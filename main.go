@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.24"
+	version = "1.14.29"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -251,29 +251,33 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 // -----------------------------------------------------------------------------
 
 type upstreamProfile struct {
-	Key       string        // 存储于凭据文件 edition 字段的站点标识
-	Label     string        // 控制台展示名
-	Base      string        // 上游 API 基础地址
-	Origin    string        // Origin/Referer 伪装来源（各站 Web 控制台）
-	Platform  string        // auth/state 的 platform 参数
-	ClientUA  string        // User-Agent
-	ClientID  string        // X-Client-ID
-	ClientVer string        // X-Client-Version
-	Product   string        // X-Product
-	LoginTTL  time.Duration // login 命令等待授权完成的超时
+	Key         string        // 存储于凭据文件 edition 字段的站点标识
+	Label       string        // 控制台展示名
+	Base        string        // 认证、刷新、额度等 API 基础地址
+	DefaultBase string        // 生产默认 Base；测试/本地可覆盖 Base 时不用 ChatBase
+	ChatBase    string        // 仅模型请求使用的基础地址
+	Origin      string        // Origin/Referer 伪装来源（各站 Web 控制台）
+	Platform    string        // auth/state 的 platform 参数
+	ClientUA    string        // User-Agent
+	ClientID    string        // X-Client-ID
+	ClientVer   string        // X-Client-Version
+	Product     string        // X-Product
+	LoginTTL    time.Duration // login 命令等待授权完成的超时
 }
 
 var (
 	profileCN = upstreamProfile{
 		Key: "cn", Label: "国内站",
-		Base: "https://copilot.tencent.com", Origin: "https://www.codebuddy.cn",
+		Base: "https://copilot.tencent.com", DefaultBase: "https://copilot.tencent.com",
+		ChatBase: "https://www.workbuddy.cn", Origin: "https://www.codebuddy.cn",
 		Platform: "VSCode", ClientUA: "CLI/2.143.1 CodeBuddy/2.143.1",
 		ClientID: "codebuddy-cli", ClientVer: "2.143.1", Product: "SaaS",
 		LoginTTL: 5 * time.Minute,
 	}
 	profileINTL = upstreamProfile{
 		Key: "intl", Label: "国际站",
-		Base: "https://www.workbuddy.ai", Origin: "https://www.workbuddy.ai",
+		Base: "https://www.workbuddy.ai", DefaultBase: "https://www.workbuddy.ai",
+		ChatBase: "https://www.workbuddy.ai", Origin: "https://www.workbuddy.ai",
 		Platform: "workbuddy-ai", ClientUA: "CLI/2.143.1 CodeBuddy/2.143.1",
 		ClientID: "codebuddy-cli", ClientVer: "2.143.1", Product: "SaaS",
 		LoginTTL: 15 * time.Minute, // 浏览器内登录（邮箱/验证码/SSO）比扫码慢，放宽超时
@@ -304,7 +308,14 @@ func (p *upstreamProfile) authTokenURL(state string) string {
 
 func (p *upstreamProfile) tokenRefreshURL() string { return p.Base + "/v2/plugin/auth/token/refresh" }
 
-func (p *upstreamProfile) chatURL() string { return p.Base + "/v2/chat/completions" }
+func (p *upstreamProfile) chatURL() string {
+	base := p.Base
+	// 测试或本地会把 Base 指向假上游；只有生产默认 Base 才切到 ChatBase。
+	if p.ChatBase != "" && (p.DefaultBase == "" || p.Base == p.DefaultBase) {
+		base = p.ChatBase
+	}
+	return base + "/v2/chat/completions"
+}
 
 func (p *upstreamProfile) quotaSummaryURL() string {
 	return p.Origin + "/billing/meter/get-user-resource-summary"
@@ -597,6 +608,9 @@ func main() {
 	})
 	serveCommand := command == "serve" || command == "run" || command == "start"
 	if serveCommand || command == "probe" {
+		if err := ensureRuntimeConfigFile(runtimeConfigFile); err != nil {
+			fmt.Fprintf(os.Stderr, "配置初始化警告: %v（继续使用内存默认值）\n", err)
+		}
 		if err := loadRuntimeConfig(runtimeConfigFile); err != nil {
 			fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 			os.Exit(1)
@@ -3640,7 +3654,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		prof := acc.Profile()
 
 		debugEvent(r, "info", "upstream_request_started", map[string]any{
-			"upstream_host": prof.Base,
+			"upstream_host": prof.chatURL(),
 			"attempt":       attempt + 1,
 			"payload_bytes": len(upstreamBytes),
 		})
@@ -3652,7 +3666,7 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		acc.lock.Unlock()
 		if err != nil {
 			debugEvent(r, "error", "upstream_request_failed", map[string]any{
-				"upstream_host": prof.Base,
+				"upstream_host": prof.chatURL(),
 				"error_type":    debugErrorType(err),
 				"error":         safeDebugError(err),
 			})
@@ -3672,12 +3686,12 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			errStr := string(errBody)
 			debugFullUpstreamError(r, resp, errBody)
 			debugEvent(r, "warn", "upstream_response_rejected", map[string]any{
-				"upstream_host": prof.Base,
+				"upstream_host": prof.chatURL(),
 				"status_code":   resp.StatusCode,
 				"error_code":    modelStatusFromError(resp.StatusCode, errStr),
 			})
 			log.Printf("[#%d] 账号 %s [%s] 上游返回 HTTP %d: %s (耗时 %v)", reqID, acc.Path, prof.Label, resp.StatusCode, errStr, time.Since(startTime))
-			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
+			log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=失败 账号=%s", traceID, reqID, prof.chatURL(), resp.StatusCode, acc.Path)
 
 			if isQuotaExhausted(resp.StatusCode, errStr) {
 				markModelQuotaBlocked(acc, modelName, errStr)
@@ -3733,10 +3747,10 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		}
 
 		debugEvent(r, "info", "upstream_response_received", map[string]any{
-			"upstream_host": prof.Base,
+			"upstream_host": prof.chatURL(),
 			"status_code":   resp.StatusCode,
 		})
-		log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=成功 账号=%s", traceID, reqID, prof.Base, resp.StatusCode, acc.Path)
+		log.Printf("[外部接口] traceId=%s requestId=%d 上游=%s 状态码=%d 结果=成功 账号=%s", traceID, reqID, prof.chatURL(), resp.StatusCode, acc.Path)
 		recordModelSuccess(modelName)
 		// 用空闲看门狗包装响应体：持续有数据就永不超时，超过 upstreamIdleTimeout 无数据才中断。
 		// 关闭响应体时会一并取消上游 context，完成清理。
@@ -4129,8 +4143,11 @@ func applyThinkingRules(obj map[string]any, modelName string) {
 		delete(obj, "reasoning_summary")
 		return
 	}
-	// 客户端显式请求思考时，设置 auto
-	obj["reasoning_summary"] = "auto"
+	// 客户端显式请求思考时，只在未指定摘要粒度时补 auto；
+	// Codex 的 detailed 等显式值必须保留，不能被网关降档。
+	if summary, ok := obj["reasoning_summary"].(string); !ok || strings.TrimSpace(summary) == "" {
+		obj["reasoning_summary"] = "auto"
+	}
 }
 
 func sanitizeMessages(obj map[string]any) int {

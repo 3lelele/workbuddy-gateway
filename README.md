@@ -14,7 +14,7 @@ go build -o workbuddy-gateway .
 
 Windows 可使用 `.\workbuddy-gateway.exe`。管理端口默认 `8316`，模型 API 默认 `8317`。
 
-- 首次使用可复制 `config.example.json` 为 `config.json`，并按需要设置管理 Key 和 API 鉴权。
+- 首次启动会在工作目录生成完整的默认 `config.json`；旧配置缺少 `identity` 段时也会自动补充。可按需要设置管理 Key、API 鉴权和身份替换。
 - **后台价格探测默认关闭**，只有显式传入 `-allow-price-probes` 才开启；主动生成请求可能消耗积分。
 - 网页配置页支持风险确认后的完整 JSON 编辑；监听端口修改需重启服务。
 - `config.json` 和账号凭据含敏感信息，已由 Git 忽略，不要公开分享。
