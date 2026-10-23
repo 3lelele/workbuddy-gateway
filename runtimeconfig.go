@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -83,8 +84,8 @@ func hasModelNames(names []string) bool {
 }
 
 // ensureRuntimeConfigFile creates a complete default config for a new user and
-// adds the identity block to an older config once. It never overwrites an
-// existing identity block and never prevents startup when the file is read-only.
+// adds missing default sections to older configs. Existing values are preserved;
+// initialization errors are warnings at startup, not a reason to stop serving.
 func ensureRuntimeConfigFile(path string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -101,17 +102,52 @@ func ensureRuntimeConfigFile(path string) error {
 		return err
 	}
 	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := json.Unmarshal(raw, &doc); err != nil || doc == nil {
 		return nil // 交给正常配置校验报错；不覆盖半写或非法配置。
 	}
-	if _, exists := doc["identity"]; exists {
+	changed := false
+	hasKey := func(object map[string]json.RawMessage, name string) bool {
+		for k := range object {
+			if strings.EqualFold(k, name) {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasKey(doc, "identity") {
+		doc["identity"], err = json.Marshal(defaultIdentityConfig())
+		if err != nil {
+			return err
+		}
+		changed = true
+	}
+	if !hasKey(doc, "concurrent") {
+		doc["concurrent"], _ = json.Marshal(normalizeConcurrentConfig(concurrentFileConfig{}))
+		changed = true
+	} else {
+		for key, value := range doc {
+			if !strings.EqualFold(key, "concurrent") {
+				continue
+			}
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(value, &fields) != nil || fields == nil {
+				break
+			}
+			if !hasKey(fields, "MaxAcc") {
+				fields["MaxAcc"] = json.RawMessage("4")
+				changed = true
+			}
+			if !hasKey(fields, "MaxGlobal") {
+				fields["MaxGlobal"] = json.RawMessage("0")
+				changed = true
+			}
+			doc[key], _ = json.Marshal(fields)
+			break
+		}
+	}
+	if !changed {
 		return nil
 	}
-	identity, err := json.Marshal(defaultIdentityConfig())
-	if err != nil {
-		return err
-	}
-	doc["identity"] = identity
 	updated, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
@@ -140,7 +176,7 @@ func ensureRuntimeConfigFile(path string) error {
 	if err := os.Rename(temporary, path); err != nil {
 		return err
 	}
-	log.Printf("[配置初始化] 已为旧配置补充 identity 段；其他配置保留，后续修改仍可热加载")
+	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；已有值和其他配置保留，后续修改仍可热加载")
 	return nil
 }
 
@@ -219,6 +255,8 @@ func applyRuntimeConfig(c runtimeFileConfig, hot bool, trace string) error {
 	_ = setModelAccountFilter(c.Models.Accounts)
 	setSystemPromptConfig(c.SystemPrompt.Fallback, c.SystemPrompt.Force)
 	setIdentityConfig(c.Identity)
+	modelConcurrency.configure(c.Concurrent)
+	logConcurrentConfig(trace)
 	identityEnabled, identityTarget, identityRuleCount := identitySettingsSummary()
 	log.Printf("[身份替换配置] traceId=%s 启用=%t 目标=%s 规则数=%d 说明=仅处理 system/developer/assistant 文本；热加载只影响后续请求", trace, identityEnabled, identityTarget, identityRuleCount)
 	previousProfile := officialRequests.Load()

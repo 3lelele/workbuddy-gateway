@@ -57,7 +57,7 @@ func TestEnsureRuntimeConfigFileMigratesOldConfigWithoutIdentity(t *testing.T) {
 
 func TestEnsureRuntimeConfigFilePreservesExistingIdentity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	original := `{"identity":{"enabled":true,"target":"Assistant"}}`
+	original := `{"identity":{"enabled":true,"target":"Assistant"},"concurrent":{"MaxAcc":4,"MaxGlobal":0}}`
 	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
 		t.Fatal(err)
 	}

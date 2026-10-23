@@ -21,6 +21,10 @@
       "ZCode": "WorkBuddy"
     }
   },
+  "concurrent": {
+    "MaxAcc": 4,
+    "MaxGlobal": 0
+  },
   "debug": {
     "enabled": false,
     "fullRequests": false
