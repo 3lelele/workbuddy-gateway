@@ -120,6 +120,7 @@ func TestJWTExpiryAndRefreshTokenExpiryFallback(t *testing.T) {
 }
 
 func TestSanitizeUpstreamTextHidesIdentifiers(t *testing.T) {
+	// Synthetic identifier only; never copy identifiers from live accounts.
 	raw := `upstream 401: {"msg":"userID:00000000-0000-4000-8000-000000000001","token":"Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig"}`
 	got := sanitizeUpstreamText(raw)
 	for _, secret := range []string{"00000000-0000-4000-8000-000000000001", "eyJhbGciOiJSUzI1NiJ9"} {
