@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,19 +36,21 @@ type checkinStatusSnapshot struct {
 
 // Only hashes and fixed status messages are saved; never save UID/token/nickname.
 type checkinRecord struct {
-	FirstAt  int64  `json:"firstAt"`
-	RetryAt  int64  `json:"retryAt"`
-	Attempts int    `json:"attempts"`
-	Status   string `json:"status"`
-	LastAt   int64  `json:"lastAt,omitempty"`
-	Message  string `json:"message,omitempty"`
-	RetryEnd bool   `json:"retryEnd,omitempty"`
+	FirstAt   int64  `json:"firstAt"`
+	RetryAt   int64  `json:"retryAt"`
+	StartupAt int64  `json:"startupAt,omitempty"`
+	Attempts  int    `json:"attempts"`
+	Status    string `json:"status"`
+	LastAt    int64  `json:"lastAt,omitempty"`
+	Message   string `json:"message,omitempty"`
+	RetryEnd  bool   `json:"retryEnd,omitempty"`
 }
 
 type checkinDocument struct {
-	Schema int                       `json:"schema"`
-	Date   string                    `json:"date"`
-	Plans  map[string]*checkinRecord `json:"plans"`
+	Schema        int                       `json:"schema"`
+	Date          string                    `json:"date"`
+	Plans         map[string]*checkinRecord `json:"plans"`
+	LastStartupAt int64                     `json:"lastStartupAt,omitempty"`
 }
 
 type checkinTarget struct {
@@ -161,6 +164,11 @@ func (s *dailyCheckinScheduler) loadLocked() {
 		return
 	}
 	start, retry, end := checkinWindows(day)
+	dayEnd := start.Add(16 * time.Hour)
+	if doc.LastStartupAt != 0 && (doc.LastStartupAt < start.UnixMilli() || doc.LastStartupAt >= dayEnd.UnixMilli()) {
+		s.blockLocked("启动补签间隔记录无效；原文件已保留")
+		return
+	}
 	for key, p := range doc.Plans {
 		_, keyErr := hex.DecodeString(key)
 		validState := p != nil && (p.Status == "pending" || p.Status == "running" ||
@@ -168,6 +176,7 @@ func (s *dailyCheckinScheduler) loadLocked() {
 		if keyErr != nil || len(key) != 64 || !validState || p.Attempts < 0 || p.Attempts > 2 ||
 			p.FirstAt < start.UnixMilli() || p.FirstAt >= retry.UnixMilli() ||
 			p.RetryAt < retry.UnixMilli() || p.RetryAt >= end.UnixMilli() ||
+			(p.StartupAt != 0 && (p.StartupAt < start.UnixMilli() || p.StartupAt >= dayEnd.UnixMilli())) ||
 			(p.Status == "success" && p.Attempts == 0) {
 			s.blockLocked("状态文件记录无效；为防止重复请求暂停签到")
 			return
@@ -224,8 +233,9 @@ func (s *dailyCheckinScheduler) saveLocked(trace string) bool {
 	return true
 }
 
-// Startup restores/plans only. Past first/retry deadlines are never replayed.
-// New accounts also get one stable full-window plan, not an event-triggered call.
+// Startup after 08:00 queues only pending, never-attempted accounts. The first
+// runs immediately; subsequent requests are spaced at least one minute apart.
+// Credential hot reloads do not create a startup queue.
 func (s *dailyCheckinScheduler) planAndClaim(now time.Time, targets []checkinTarget, startup bool) []checkinJob {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -244,13 +254,34 @@ func (s *dailyCheckinScheduler) planAndClaim(now time.Time, targets []checkinTar
 		dirty = true
 	}
 	start, retry, end := checkinWindows(now)
+	dayEnd := start.Add(16 * time.Hour)
+	if startup {
+		// Recover every interrupted record, including accounts removed from the
+		// current pool, so an old in-flight marker cannot stall the whole queue.
+		for _, p := range s.doc.Plans {
+			if p.Status != "running" {
+				continue
+			}
+			p.Status, p.Message = "failed", "上次尝试未能确认结果；不补发原请求"
+			if p.StartupAt != 0 && !now.Before(start) {
+				s.doc.LastStartupAt = max(s.doc.LastStartupAt, now.UnixMilli())
+			}
+			if p.Attempts == 2 {
+				p.RetryEnd = true
+				p.Message += "；今日已用完两次尝试"
+			}
+			dirty = true
+		}
+	}
 	s.active = map[string]bool{}
 	var jobs []checkinJob
+	var eligible []checkinTarget
 	for _, target := range targets {
 		if !target.eligible || s.active[target.key] {
 			continue
 		}
 		s.active[target.key] = true
+		eligible = append(eligible, target)
 		p := s.doc.Plans[target.key]
 		if p == nil {
 			firstOffset, e1 := s.random(retry.Sub(start))
@@ -266,43 +297,57 @@ func (s *dailyCheckinScheduler) planAndClaim(now time.Time, targets []checkinTar
 				newTraceID(), day, target.key[:12], time.UnixMilli(p.FirstAt).In(checkinZone).Format("15:04:05"),
 				time.UnixMilli(p.RetryAt).In(checkinZone).Format("15:04:05"))
 			dirty = true
-			if p.FirstAt <= now.UnixMilli() {
-				p.Status, p.Message = "missed", "今日随机签到时间已过；启动或新增账号均不补签"
+			if p.FirstAt <= now.UnixMilli() && !(startup && !now.Before(start)) {
+				p.Status, p.Message = "missed", "今日随机签到时间已过；账号事件不触发补签"
 			}
-		}
-		if startup && p.Status == "running" {
-			p.Status, p.Message = "failed", "上次尝试未能确认结果；不补发原请求"
-			if p.Attempts == 2 {
-				p.RetryEnd = true
-				p.Message += "；今日已用完两次尝试"
-			}
-			dirty = true
-		}
-		if startup && p.Attempts == 0 && p.Status == "pending" && p.FirstAt <= now.UnixMilli() {
-			p.Status, p.Message, dirty = "missed", "今日随机签到时间已过；重启不补签", true
 		}
 		if p.Status == "failed" && p.Attempts == 1 && !p.RetryEnd &&
-			(!now.Before(end) || startup && p.RetryAt <= now.UnixMilli()) {
+			(!now.Before(end) || startup && p.RetryAt <= now.UnixMilli() ||
+				p.StartupAt != 0 && max(p.RetryAt, s.startupDueLocked(p)) >= end.UnixMilli()) {
 			p.RetryEnd, dirty = true, true
 			p.Message = "今日失败重试时间已过；不补签，当天不再重试"
 		}
-		if p.Status == "pending" && !now.Before(retry) {
+		if p.Status == "pending" && p.StartupAt == 0 && !now.Before(retry) && !startup {
 			p.Status, p.Message, dirty = "missed", "今日首次签到窗口已过；不补签", true
 		}
-		if startup || p.Status == "success" || p.Status == "missed" || p.Status == "running" {
+		if p.Status == "pending" && p.StartupAt != 0 && s.startupDueLocked(p) >= dayEnd.UnixMilli() {
+			p.Status, p.Message, dirty = "missed", "今日剩余时间不足以保持一分钟间隔；不跨日补签", true
+		}
+	}
+	if startup && !now.Before(start) {
+		if s.queueStartupLocked(now, eligible, dayEnd) {
+			dirty = true
+		}
+	}
+	startupBusy := s.startupBusyLocked()
+	for _, target := range eligible {
+		p := s.doc.Plans[target.key]
+		if p.Status == "success" || p.Status == "missed" || p.Status == "running" {
+			continue
+		}
+		if p.StartupAt != 0 && startupBusy {
 			continue
 		}
 		attempt, until := 0, retry
-		if p.Status == "pending" && p.Attempts == 0 && !now.Before(start) && now.Before(retry) && p.FirstAt <= now.UnixMilli() {
+		if p.Status == "pending" && p.Attempts == 0 && p.StartupAt != 0 &&
+			!now.Before(start) && now.Before(dayEnd) && s.startupDueLocked(p) <= now.UnixMilli() {
+			attempt, until = 1, dayEnd
+		} else if !startup && p.Status == "pending" && p.Attempts == 0 && p.StartupAt == 0 &&
+			!now.Before(start) && now.Before(retry) && p.FirstAt <= now.UnixMilli() {
 			attempt = 1
-		} else if p.Status == "failed" && p.Attempts == 1 && !p.RetryEnd &&
-			!now.Before(retry) && now.Before(end) && p.RetryAt <= now.UnixMilli() {
+		} else if !startup && p.Status == "failed" && p.Attempts == 1 && !p.RetryEnd &&
+			!now.Before(retry) && now.Before(end) && p.RetryAt <= now.UnixMilli() &&
+			(p.StartupAt == 0 || s.startupDueLocked(p) <= now.UnixMilli()) {
 			attempt, until = 2, end
 		}
 		if attempt == 0 {
 			continue
 		}
 		p.Attempts, p.Status, p.LastAt = attempt, "running", now.UnixMilli()
+		if p.StartupAt != 0 {
+			s.doc.LastStartupAt = now.UnixMilli()
+			startupBusy = true
+		}
 		p.Message = "正在按北京时间计划签到"
 		trace := newTraceID()
 		jobs = append(jobs, checkinJob{key: target.key, date: day, attempt: attempt, end: until, account: target.account, trace: trace, started: now})
@@ -313,7 +358,7 @@ func (s *dailyCheckinScheduler) planAndClaim(now time.Time, targets []checkinTar
 		return nil
 	}
 	for _, job := range jobs {
-		log.Printf("[每日签到] traceId=%s 阶段=尝试预占已落盘 日期=%s 账号标识=%s 尝试=%d 截止=%s 结果=允许执行 说明=同日最多两次；启动或事件不补发",
+		log.Printf("[每日签到] traceId=%s 阶段=尝试预占已落盘 日期=%s 账号标识=%s 尝试=%d 截止=%s 结果=允许执行 说明=同日最多两次；启动补签间隔至少一分钟",
 			job.trace, job.date, job.key[:12], job.attempt, job.end.In(checkinZone).Format("15:04:05"))
 	}
 	next := s.nextLocked(now)
@@ -324,13 +369,71 @@ func (s *dailyCheckinScheduler) planAndClaim(now time.Time, targets []checkinTar
 	if nextMillis != s.lastNext || startup || dirty {
 		s.lastNext = nextMillis
 		logScheduledTask("daily_checkin", "scheduled", "", trace, time.Time{}, next,
-			"北京时间08:00–09:30按账号随机；失败09:30–10:00仅重试一次；启动/事件不补签")
+			"北京时间08:00–09:30随机；08:00后启动待签账号每隔一分钟补签；失败09:30–10:00仅重试一次；账号事件不触发补签")
 	}
 	return jobs
 }
 
+func (s *dailyCheckinScheduler) startupDueLocked(p *checkinRecord) int64 {
+	return max(p.StartupAt, s.doc.LastStartupAt+time.Minute.Milliseconds())
+}
+
+func (s *dailyCheckinScheduler) startupBusyLocked() bool {
+	for _, p := range s.doc.Plans {
+		if p.StartupAt != 0 && p.Status == "running" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *dailyCheckinScheduler) queueStartupLocked(now time.Time, targets []checkinTarget, dayEnd time.Time) bool {
+	var pending []checkinTarget
+	for _, t := range targets {
+		p := s.doc.Plans[t.key]
+		if p.Status == "pending" && p.Attempts == 0 {
+			pending = append(pending, t)
+		}
+	}
+	// Keep already-persisted queue order across repeated restarts.
+	sort.SliceStable(pending, func(i, j int) bool {
+		a, b := s.doc.Plans[pending[i].key].StartupAt, s.doc.Plans[pending[j].key].StartupAt
+		if a == 0 {
+			return false
+		}
+		return b == 0 || a < b
+	})
+	slot := max(now.UnixMilli(), s.doc.LastStartupAt+time.Minute.Milliseconds())
+	dirty := false
+	for _, t := range pending {
+		p := s.doc.Plans[t.key]
+		at := max(slot, p.StartupAt)
+		if at >= dayEnd.UnixMilli() {
+			p.Status, p.Message = "missed", "启动补签队列已超过北京时间今天；不跨日补签"
+			dirty = true
+			continue
+		}
+		if p.StartupAt != at {
+			p.StartupAt = at
+			dirty = true
+		}
+		message := "启动补签排队中；前一请求完成后至少间隔一分钟"
+		if p.Message != message {
+			p.Message = message
+			dirty = true
+		}
+		slot = at + time.Minute.Milliseconds()
+	}
+	if len(pending) > 0 {
+		log.Printf("[签到计划] traceId=%s 阶段=启动补签排队 日期=%s 待签账号=%d 间隔秒=60 说明=仅尝试次数为零的待签账号；已签及失败账号不入队；计划先落盘",
+			newTraceID(), s.doc.Date, len(pending))
+	}
+	return dirty
+}
+
 func (s *dailyCheckinScheduler) nextLocked(now time.Time) time.Time {
 	var next time.Time
+	start, _, retryEnd := checkinWindows(now)
 	for key, p := range s.doc.Plans {
 		if !s.active[key] {
 			continue
@@ -338,8 +441,20 @@ func (s *dailyCheckinScheduler) nextLocked(now time.Time) time.Time {
 		at := int64(0)
 		if p.Status == "pending" && p.Attempts == 0 {
 			at = p.FirstAt
+			if p.StartupAt != 0 {
+				at = s.startupDueLocked(p)
+				if at >= start.Add(16*time.Hour).UnixMilli() {
+					continue
+				}
+			}
 		} else if p.Status == "failed" && p.Attempts == 1 && !p.RetryEnd {
 			at = p.RetryAt
+			if p.StartupAt != 0 {
+				at = max(at, s.startupDueLocked(p))
+			}
+			if at >= retryEnd.UnixMilli() {
+				continue
+			}
 		}
 		if at > now.UnixMilli() && (next.IsZero() || time.UnixMilli(at).Before(next)) {
 			next = time.UnixMilli(at)
@@ -382,6 +497,11 @@ func (s *dailyCheckinScheduler) runJob(ctx context.Context, job checkinJob) {
 		return
 	}
 	status := "failed"
+	if p.StartupAt != 0 && checkinDay(now) == job.date {
+		// Persist completion too: slow credential reads/network IO must not
+		// collapse the one-minute gap between actual requests.
+		s.doc.LastStartupAt = max(s.doc.LastStartupAt, now.UnixMilli())
+	}
 	if err == nil && (result == "ok" || result == "already") {
 		p.Status, p.Message, status = "success", "北京时间今天已签到", "success"
 	} else {
@@ -389,6 +509,12 @@ func (s *dailyCheckinScheduler) runJob(ctx context.Context, job checkinJob) {
 		if job.attempt == 2 {
 			p.RetryEnd = true
 			p.Message += "；今日已用完两次尝试，不再重试"
+		} else {
+			_, _, retryEnd := checkinWindows(now)
+			if !now.Before(retryEnd) {
+				p.RetryEnd = true
+				p.Message += "；已过今日失败重试窗口，不再重试"
+			}
 		}
 	}
 	s.saveLocked(job.trace)
@@ -409,12 +535,24 @@ func backgroundDailyCheckin(ctx context.Context) {
 }
 
 func (s *dailyCheckinScheduler) run(ctx context.Context) {
-	s.planAndClaim(s.now(), currentCheckinTargets(), true)
-	log.Printf("[每日签到] traceId=%s 阶段=启动 结果=仅恢复计划 说明=启动、重启及账号池事件均不触发签到；错过计划不补发", newTraceID())
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	if ctx.Err() != nil {
+		return
+	}
 	var workers sync.WaitGroup
 	defer workers.Wait()
+	dispatch := func(jobs []checkinJob) {
+		for _, job := range jobs {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				s.runJob(ctx, job)
+			}()
+		}
+	}
+	dispatch(s.planAndClaim(s.now(), currentCheckinTargets(), true))
+	log.Printf("[每日签到] traceId=%s 阶段=启动 结果=按北京时间恢复计划 说明=08:00前仅等待随机计划；08:00后待签账号立即开始一分钟间隔补签；账号事件不触发补签", newTraceID())
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -423,14 +561,7 @@ func (s *dailyCheckinScheduler) run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			jobs := s.planAndClaim(s.now(), currentCheckinTargets(), false)
-			for _, job := range jobs {
-				workers.Add(1)
-				go func() {
-					defer workers.Done()
-					s.runJob(ctx, job)
-				}()
-			}
+			dispatch(s.planAndClaim(s.now(), currentCheckinTargets(), false))
 		}
 	}
 }
@@ -453,8 +584,23 @@ func (s *dailyCheckinScheduler) view(target checkinTarget, now time.Time) checki
 			out.Status, out.Attempts, out.LastAt, out.Message = p.Status, p.Attempts, p.LastAt/1000, p.Message
 			if p.Status == "pending" && p.Attempts == 0 {
 				out.NextAt = p.FirstAt / 1000
+				if p.StartupAt != 0 {
+					out.NextAt = s.startupDueLocked(p) / 1000
+					start, _, _ := checkinWindows(now)
+					if out.NextAt >= start.Add(16*time.Hour).Unix() {
+						out.Status, out.NextAt = "missed", 0
+						out.Message = "今日剩余时间不足以保持一分钟间隔；不跨日补签"
+					}
+				}
 			} else if p.Status == "failed" && p.Attempts == 1 && !p.RetryEnd {
 				out.NextAt = p.RetryAt / 1000
+				if p.StartupAt != 0 {
+					out.NextAt = max(p.RetryAt, s.startupDueLocked(p)) / 1000
+				}
+				_, _, retryEnd := checkinWindows(now)
+				if out.NextAt >= retryEnd.Unix() {
+					out.NextAt = 0
+				}
 			}
 			return out
 		}

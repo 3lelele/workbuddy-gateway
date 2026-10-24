@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.36"
+	version = "1.14.37"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -2499,7 +2499,7 @@ func isAlreadyCheckedIn(status int, message string) bool {
 }
 
 // checkinAccount is the single-attempt transport. Only the persisted scheduler
-// calls it automatically; startup and credential events never invoke it.
+// calls it automatically; credential events never invoke it directly.
 func checkinAccount(ctx context.Context, acc *Account) (string, error) {
 	return checkinAccountWithTrace(ctx, acc, newTraceID())
 }

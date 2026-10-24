@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -61,8 +62,8 @@ func TestCheckinPlanPersistsWithoutStartupOrCredentialEventRequests(t *testing.T
 		}
 	}
 	restarted := newDailyCheckinScheduler(s.file)
-	if jobs := restarted.planAndClaim(checkinAt(8, 0), targets, true); len(jobs) != 0 {
-		t.Fatal("restart sent a request")
+	if jobs := restarted.planAndClaim(checkinAt(7, 45), targets, true); len(jobs) != 0 {
+		t.Fatal("restart before 08:00 sent a request")
 	}
 	if got := restarted.doc.Plans[target.key]; got.FirstAt != p.FirstAt || got.RetryAt != p.RetryAt {
 		t.Fatal("restart rerolled schedule")
@@ -163,8 +164,8 @@ func TestCheckinFailureRetriesExactlyOnceInSecondWindow(t *testing.T) {
 	}
 }
 
-func TestCheckinRestartNeverCatchesUpMissedFirstOrRetry(t *testing.T) {
-	for _, mode := range []string{"first", "retry", "interrupted-first", "interrupted-retry"} {
+func TestCheckinRestartDoesNotReplayFailuresOrInterruptedRequests(t *testing.T) {
+	for _, mode := range []string{"retry", "interrupted-first", "interrupted-retry"} {
 		t.Run(mode, func(t *testing.T) {
 			s, now, target := checkinFixture(t)
 			targets := []checkinTarget{target}
@@ -419,7 +420,7 @@ func TestCheckinSnapshotAndTableShowTodayWithoutChangingModelLedger(t *testing.T
 	}
 	row := taskByID(t, taskViewDefinitions(), "daily_checkin")
 	if !strings.Contains(row.Schedule, "08:00–09:30") || !strings.Contains(row.Schedule, "09:30–10:00") ||
-		!strings.Contains(row.Schedule, "不补签") || strings.Contains(row.Schedule, "事件可能提前触发") {
+		!strings.Contains(row.Schedule, "至少1分钟") || strings.Contains(row.Schedule, "事件可能提前触发") {
 		t.Fatalf("task page advertises old scheduling semantics: %s", row.Schedule)
 	}
 }
@@ -437,7 +438,7 @@ func TestCheckinCredentialIdentityChangeCannotUseOldReservation(t *testing.T) {
 	}
 }
 
-func TestCheckinRealBackgroundLoopNeverSendsOnRestart(t *testing.T) {
+func TestCheckinRealBackgroundLoopRunsSinglePendingAccountImmediately(t *testing.T) {
 	s, now, target := checkinFixture(t)
 	s.planAndClaim(*now, []checkinTarget{target}, true)
 	*now = checkinAt(8, 50) // persisted 08:45 plan is in the past
@@ -448,6 +449,7 @@ func TestCheckinRealBackgroundLoopNeverSendsOnRestart(t *testing.T) {
 		calls.Add(1)
 		return "ok", nil
 	}
+	dailyCheckins = n
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { n.run(ctx); close(done) }()
@@ -455,8 +457,8 @@ func TestCheckinRealBackgroundLoopNeverSendsOnRestart(t *testing.T) {
 	<-timer.C // include at least one real timer tick, not just helper calls
 	cancel()
 	<-done
-	if calls.Load() != 0 || n.view(target, *now).Status != "missed" {
-		t.Fatal("background startup/timer caught up a missed account")
+	if calls.Load() != 1 || n.view(target, *now).Status != "success" {
+		t.Fatal("background startup did not sign the single pending account exactly once")
 	}
 }
 
@@ -536,5 +538,280 @@ func TestCheckinEndToEndTwoHTTPAttemptsSurviveRestart(t *testing.T) {
 	restarted.planAndClaim(*now, targets, true)
 	if len(restarted.planAndClaim(*now, targets, false)) != 0 || calls.Load() != 2 {
 		t.Fatal("third HTTP request after success/restart")
+	}
+}
+
+func checkinStartupTargets(t *testing.T, count int) []checkinTarget {
+	t.Helper()
+	accountMu.Lock()
+	defer accountMu.Unlock()
+	accounts = nil
+	var targets []checkinTarget
+	for i := 0; i < count; i++ {
+		a := &Account{Path: fmt.Sprintf("synthetic-startup-%d.json", i), Auth: &StoredAuth{
+			Edition: "cn", Auth: StoredTokens{AccessToken: "synthetic-startup-token"},
+			Account: StoredAccount{UID: fmt.Sprintf("synthetic-startup-user-%d", i)},
+		}}
+		accounts = append(accounts, a)
+		targets = append(targets, checkinTargetLocked(a))
+	}
+	return targets
+}
+
+func TestCheckinStartupSinglePendingAfterEightIsImmediate(t *testing.T) {
+	for _, at := range []time.Time{checkinAt(8, 0), checkinAt(8, 20), checkinAt(10, 30), checkinAt(23, 59)} {
+		t.Run(at.Format("15-04"), func(t *testing.T) {
+			s, now, target := checkinFixture(t)
+			targets := []checkinTarget{target}
+			s.planAndClaim(*now, targets, true)
+			*now = at
+			jobs := s.planAndClaim(*now, targets, true)
+			if len(jobs) != 1 || jobs[0].attempt != 1 {
+				t.Fatal("single pending account should run immediately on startup after 08:00")
+			}
+			var saved checkinDocument
+			raw, _ := os.ReadFile(s.file)
+			if json.Unmarshal(raw, &saved) != nil || saved.Plans[target.key].Attempts != 1 ||
+				saved.Plans[target.key].StartupAt != at.UnixMilli() {
+				t.Fatal("startup attempt was not durably reserved")
+			}
+			s.perform = func(context.Context, *Account, string) (string, error) { return "ok", nil }
+			s.runJob(context.Background(), jobs[0])
+			if s.view(target, *now).Status != "success" || len(s.planAndClaim(*now, targets, true)) != 0 {
+				t.Fatal("completed account was replayed on another restart")
+			}
+		})
+	}
+}
+
+func TestCheckinStartupMultipleAccountsOneMinuteApart(t *testing.T) {
+	s, now, _ := checkinFixture(t)
+	targets := checkinStartupTargets(t, 3)
+	s.planAndClaim(*now, targets, true)
+	s.perform = func(context.Context, *Account, string) (string, error) { return "ok", nil }
+	*now = checkinAt(8, 20)
+	for i := range targets {
+		jobs := s.planAndClaim(*now, targets, i == 0)
+		if len(jobs) != 1 || jobs[0].key != targets[i].key {
+			t.Fatalf("queue item %d did not dispatch alone", i)
+		}
+		s.runJob(context.Background(), jobs[0])
+		*now = now.Add(59 * time.Second)
+		if len(s.planAndClaim(*now, targets, false)) != 0 {
+			t.Fatal("next account dispatched before the minute elapsed")
+		}
+		*now = now.Add(time.Second)
+	}
+	if len(s.planAndClaim(*now, targets, false)) != 0 {
+		t.Fatal("finished queue repeated")
+	}
+	for _, target := range targets {
+		if p := s.doc.Plans[target.key]; p.Attempts != 1 || p.Status != "success" {
+			t.Fatal("queue did not sign each account exactly once")
+		}
+	}
+}
+
+func TestCheckinStartupSpacingSurvivesRestartAndSlowRequest(t *testing.T) {
+	s, now, _ := checkinFixture(t)
+	targets := checkinStartupTargets(t, 3)
+	s.planAndClaim(*now, targets, true)
+	*now = checkinAt(8, 20)
+	first := s.planAndClaim(*now, targets, true)[0]
+	// Even an unusually delayed worker cannot overlap a later queue request.
+	*now = checkinAt(8, 22)
+	if len(s.planAndClaim(*now, targets, false)) != 0 {
+		t.Fatal("another startup request overlapped the unfinished request")
+	}
+	s.perform = func(context.Context, *Account, string) (string, error) { return "ok", nil }
+	s.runJob(context.Background(), first)
+	*now = now.Add(20 * time.Second)
+	n := newDailyCheckinScheduler(s.file)
+	n.now = func() time.Time { return *now }
+	reversed := []checkinTarget{targets[2], targets[1], targets[0]}
+	if len(n.planAndClaim(*now, reversed, true)) != 0 {
+		t.Fatal("restart collapsed the interval after the previous request")
+	}
+	*now = checkinAt(8, 22).Add(59 * time.Second)
+	if len(n.planAndClaim(*now, reversed, false)) != 0 {
+		t.Fatal("persisted one-minute interval lost")
+	}
+	*now = checkinAt(8, 23)
+	jobs := n.planAndClaim(*now, reversed, false)
+	if len(jobs) != 1 || jobs[0].key != targets[1].key {
+		t.Fatal("restart lost persisted queue order or due time")
+	}
+}
+
+func TestCheckinStartupAfterRetryWindowDoesNotAddExtraRetry(t *testing.T) {
+	s, now, target := checkinFixture(t)
+	*now = checkinAt(14, 0)
+	targets := []checkinTarget{target}
+	jobs := s.planAndClaim(*now, targets, true) // new deployment with no state file
+	if len(jobs) != 1 {
+		t.Fatal("new pending account after 08:00 must start without an existing file")
+	}
+	s.perform = func(context.Context, *Account, string) (string, error) {
+		return "failed", errors.New("synthetic error")
+	}
+	s.runJob(context.Background(), jobs[0])
+	if !s.doc.Plans[target.key].RetryEnd || len(s.planAndClaim(now.Add(time.Minute), targets, false)) != 0 {
+		t.Fatal("startup catchup illegally extended the failed-retry window")
+	}
+	if len(s.planAndClaim(*now, targets, true)) != 0 {
+		t.Fatal("failed account entered a new startup queue")
+	}
+}
+
+func TestCheckinStartupRetryAlsoWaitsOneMinute(t *testing.T) {
+	s, now, target := checkinFixture(t)
+	targets := []checkinTarget{target}
+	s.planAndClaim(*now, targets, true)
+	*now = checkinAt(9, 50)
+	first := s.planAndClaim(*now, targets, true)[0]
+	s.perform = func(context.Context, *Account, string) (string, error) {
+		return "failed", errors.New("synthetic error")
+	}
+	s.runJob(context.Background(), first)
+	*now = now.Add(59 * time.Second)
+	if len(s.planAndClaim(*now, targets, false)) != 0 {
+		t.Fatal("failed startup account retried too quickly")
+	}
+	*now = now.Add(time.Second)
+	jobs := s.planAndClaim(*now, targets, false)
+	if len(jobs) != 1 || jobs[0].attempt != 2 {
+		t.Fatal("one allowed retry missing from the existing retry window")
+	}
+	s.runJob(context.Background(), jobs[0])
+	if len(s.planAndClaim(now.Add(time.Minute), targets, false)) != 0 {
+		t.Fatal("startup account exceeded its two daily attempts")
+	}
+}
+
+func TestCheckinStartupSkipsNonPendingAndDoesNotCrossMidnight(t *testing.T) {
+	s, now, _ := checkinFixture(t)
+	targets := checkinStartupTargets(t, 5)
+	s.planAndClaim(*now, targets, true)
+	for i, state := range []string{"success", "failed", "missed", "running"} {
+		p := s.doc.Plans[targets[i].key]
+		p.Status = state
+		if state != "missed" {
+			p.Attempts = 1
+		}
+	}
+	*now = checkinAt(8, 30)
+	jobs := s.planAndClaim(*now, targets, true)
+	if len(jobs) != 1 || jobs[0].key != targets[4].key {
+		t.Fatal("only pending, never-attempted accounts may enter startup catchup")
+	}
+	// Separate near-midnight state: only the first slot fits the current day.
+	late := newDailyCheckinScheduler("late-checkin-state.json")
+	late.random = s.random
+	at := checkinAt(23, 59).Add(30 * time.Second)
+	if got := late.planAndClaim(at, targets, true); len(got) != 1 {
+		t.Fatal("near-midnight first startup slot missing")
+	}
+	missed := 0
+	for _, p := range late.doc.Plans {
+		if p.Status == "missed" {
+			missed++
+		}
+	}
+	if missed != len(targets)-1 {
+		t.Fatal("startup queue must not spill into the next Beijing day")
+	}
+}
+
+func TestCheckinStartupHTTPQueuePersistsAcrossRepeatedRestarts(t *testing.T) {
+	s, now, _ := checkinFixture(t)
+	targets := checkinStartupTargets(t, 3)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v2/billing/meter/daily-checkin" {
+			t.Error("unexpected startup activity")
+		}
+		calls.Add(1)
+		w.Write([]byte(`{"code":0}`))
+	}))
+	defer server.Close()
+	oldOrigin, oldClient := profileCN.Origin, cfg.HttpClient
+	profileCN.Origin, cfg.HttpClient = server.URL, server.Client()
+	defer func() { profileCN.Origin, cfg.HttpClient = oldOrigin, oldClient }()
+	s.planAndClaim(*now, targets, true)
+	*now = checkinAt(8, 20)
+	s.runJob(context.Background(), s.planAndClaim(*now, targets, true)[0])
+	if calls.Load() != 1 {
+		t.Fatal("first startup HTTP request must be immediate and single")
+	}
+	*now = now.Add(30 * time.Second)
+	n := newDailyCheckinScheduler(s.file)
+	n.now = func() time.Time { return *now }
+	dailyCheckins = n
+	if len(n.planAndClaim(*now, targets, true)) != 0 || calls.Load() != 1 {
+		t.Fatal("quick restart replayed or collapsed HTTP spacing")
+	}
+	*now = checkinAt(8, 21)
+	n.runJob(context.Background(), n.planAndClaim(*now, targets, false)[0])
+	*now = checkinAt(8, 22)
+	n.runJob(context.Background(), n.planAndClaim(*now, targets, false)[0])
+	if calls.Load() != 3 {
+		t.Fatal("startup queue did not make exactly one HTTP request per account")
+	}
+	restarted := newDailyCheckinScheduler(s.file)
+	if len(restarted.planAndClaim(*now, targets, true)) != 0 || calls.Load() != 3 {
+		t.Fatal("completed startup queue repeated after restart")
+	}
+}
+
+func TestCheckinStartupYesterdayDoesNotCountAsToday(t *testing.T) {
+	s, now, target := checkinFixture(t)
+	targets := []checkinTarget{target}
+	s.planAndClaim(*now, targets, true)
+	s.doc.Plans[target.key].Status, s.doc.Plans[target.key].Attempts = "success", 1
+	s.saveLocked("synthetic-yesterday")
+	*now = time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC) // 08:00 Beijing, next day
+	jobs := s.planAndClaim(*now, targets, true)
+	if len(jobs) != 1 || jobs[0].date != "2026-10-26" || jobs[0].attempt != 1 {
+		t.Fatal("yesterday success prevented today's startup checkin")
+	}
+}
+
+func TestCheckinStartupInterruptedRemovedAccountDoesNotBlockQueue(t *testing.T) {
+	s, now, _ := checkinFixture(t)
+	targets := checkinStartupTargets(t, 2)
+	s.planAndClaim(*now, targets, true)
+	*now = checkinAt(8, 20)
+	s.planAndClaim(*now, targets, true) // first reservation, process exits before completion
+	n := newDailyCheckinScheduler(s.file)
+	*now = now.Add(10 * time.Second)
+	remaining := []checkinTarget{targets[1]}
+	if len(n.planAndClaim(*now, remaining, true)) != 0 {
+		t.Fatal("uncertain last request did not preserve the safety interval")
+	}
+	if n.doc.Plans[targets[0].key].Status != "failed" {
+		t.Fatal("removed interrupted account was not recovered")
+	}
+	*now = now.Add(time.Minute)
+	if jobs := n.planAndClaim(*now, remaining, false); len(jobs) != 1 || jobs[0].key != targets[1].key {
+		t.Fatal("removed account's in-flight marker permanently blocked pending accounts")
+	}
+}
+
+func TestCheckinStartupRetryDeadlineWinsOverMinuteSpacing(t *testing.T) {
+	s, now, target := checkinFixture(t)
+	targets := []checkinTarget{target}
+	s.planAndClaim(*now, targets, true)
+	*now = checkinAt(9, 59).Add(30 * time.Second)
+	job := s.planAndClaim(*now, targets, true)[0]
+	s.perform = func(context.Context, *Account, string) (string, error) {
+		return "failed", errors.New("synthetic failure")
+	}
+	s.runJob(context.Background(), job)
+	if s.view(target, *now).NextAt != 0 {
+		t.Fatal("UI advertised a retry after 10:00")
+	}
+	*now = checkinAt(10, 0).Add(30 * time.Second)
+	if len(s.planAndClaim(*now, targets, false)) != 0 {
+		t.Fatal("startup failure retried beyond the original retry window")
 	}
 }
