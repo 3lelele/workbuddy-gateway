@@ -1244,6 +1244,29 @@
     });
   }
 
+  function checkinCell(a) {
+    var c = a.checkin || {}, now = Date.now();
+    var today = new Date(now + 8 * 3600000).toISOString().slice(0, 10);
+    var status = c.status || "pending", message = c.message || "";
+    if (a.edition === "intl" || status === "unsupported") {
+      return '<span class="badge" title="国际站或企业账号不参与个人签到">—</span>';
+    }
+    if (c.date !== today) {
+      var hour = new Date(now + 8 * 3600000).getUTCHours();
+      var minute = new Date(now + 8 * 3600000).getUTCMinutes();
+      status = hour * 60 + minute >= 570 ? "missed" : "pending";
+      message = status === "missed" ? "今日窗口已过，不补签" : "等待北京时间今天的随机计划";
+    }
+    var labels = {pending: "待签", running: "待签", success: "已签", failed: "失败", missed: "未签", unknown: "未知"};
+    var styles = {success: "ok", failed: "danger", unknown: "warn"};
+    var detail = "北京时间 " + today + " · " + message;
+    if (c.date === today && c.nextAt) {
+      detail += " · 计划 " + new Date(c.nextAt * 1000).toLocaleString("zh-CN", {timeZone: "Asia/Shanghai", hour12: false});
+    }
+    return '<span class="badge ' + (styles[status] || "") + '" title="' + esc(detail) + '">' +
+      (labels[status] || "未知") + '</span>';
+  }
+
   function renderAccounts(list) {
     var onlyUsable = $("onlyUsableAccounts").checked;
     if (onlyUsable) {
@@ -1278,7 +1301,7 @@
         "<td>" + esc(quotaAmount(a, "used")) + "</td>" +
         "<td>" + esc(quotaAmount(a, "remaining")) + "</td>" +
         "<td>" + esc((a.planLabel || "-") + (a.planStale ? "（待刷新）" : "")) + "</td>" +
-        "<td>" + esc(count(a.freeModels)) + "</td>" +
+        "<td>" + checkinCell(a) + "</td>" +
         "<td>" + esc(count(a.modelCooldowns)) + "</td>" +
         "<td>" + esc(fmtTime(a.lastRefreshTime)) + "</td>" +
         "<td>" + esc(count(a.refreshFailCount)) + "</td>" +

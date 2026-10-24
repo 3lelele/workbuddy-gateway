@@ -17,7 +17,7 @@ function audit(event, fields = {}) {
 function response(status, body) {
   return {status, ok: status >= 200 && status < 300, json: async () => body};
 }
-function fixture(fetchImpl = async () => response(200, {}), cookies = new Map()) {
+function fixture(fetchImpl = async () => response(200, {}), cookies = new Map(), clock) {
   const elements = new Map(), session = new Map(), local = new Map(), alerts = [];
   const cookieWrites = [];
   function element(id) {
@@ -47,6 +47,12 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     window: {alert: message => alerts.push(message), confirm: () => true, addEventListener() {}, location: {protocol: "http:", reload() {}}},
     TextEncoder, fetch: fetchImpl, setInterval: () => 1,
   };
+  if (typeof clock === "number") {
+    context.Date = class extends Date {
+      constructor(...args) { super(...(args.length ? args : [clock])); }
+      static now() { return clock; }
+    };
+  }
   Object.defineProperty(context.document, "cookie", {
     configurable: true,
     get() { return [...cookies].map(([name, value]) => name + "=" + value).join("; "); },
@@ -187,7 +193,8 @@ test("已知零值显示0，未知额度仍显示横线", () => {
   const f = fixture();
   f.review.renderAccounts([{path: "fixture.json", state: "active", quotaKnown: true}]);
   let row = cells(f.element("accountsTable").innerHTML);
-  for (const i of [7, 8, 9, 11, 12, 14]) assert.equal(row[i], "0");
+  for (const i of [7, 8, 9, 12, 14]) assert.equal(row[i], "0");
+  assert.match(row[11], /待签|未签/, "签到列不应再显示免费模型数量");
   assert.equal(row.length, 16, "账号表应为 16 列（已去掉刷新令牌到期）");
   const accountsPage = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
   assert(!accountsPage.includes("刷新令牌到期"), "表头不应保留已删除的列");
@@ -212,6 +219,41 @@ test("企业不限量显示不限，已用保留小数；未知和有限额度�
   row = cells(f.element("accountsTable").innerHTML);
   for (const i of [7, 8, 9]) assert.equal(row[i], "-");
   audit("企业额度展示通过", {unlimited_distinct_from_unknown: true, fractional_used_preserved: true});
+});
+
+test("账号池签到列展示北京时间当天状态，移除免费模型列并转义错误提示", () => {
+  const clock = Date.parse("2026-10-25T08:20:00+08:00");
+  const f = fixture(undefined, new Map(), clock);
+  const account = {path: "synthetic.json", state: "active", freeModels: 987654};
+  for (const [status, text] of [["pending", "待签"], ["running", "待签"], ["success", "已签"],
+    ["failed", "失败"], ["missed", "未签"], ["unknown", "未知"]]) {
+    f.review.renderAccounts([{...account, checkin: {date: "2026-10-25", status,
+      message: '<img src=x onerror="bad">', nextAt: Date.parse("2026-10-25T09:45:00+08:00") / 1000}}]);
+    const row = cells(f.element("accountsTable").innerHTML);
+    assert.match(row[11], new RegExp(text));
+    assert(!f.element("accountsTable").innerHTML.includes("987654"));
+    assert(row[11].includes("&lt;img") && !row[11].includes("<img"));
+    assert(row[11].includes("北京时间 2026-10-25"));
+  }
+  f.review.renderAccounts([{...account, edition: "intl", checkin: {date: "2026-10-25", status: "pending"}}]);
+  assert.match(cells(f.element("accountsTable").innerHTML)[11], />—</);
+  f.review.renderAccounts([{...account, checkin: {date: "2026-10-25", status: "unsupported"}}]);
+  assert.match(cells(f.element("accountsTable").innerHTML)[11], />—</);
+  const html = fs.readFileSync(path.join(projectRoot, "web/index.html"), "utf8");
+  assert(html.includes("<th>签到</th>") && !html.includes("<th>免费模型</th>"));
+  audit("账号池签到列通过", {beijing_day: true, statuses: 6, private_errors_escaped: true, free_model_column_removed: true});
+});
+
+test("北京时间跨日后不沿用昨日已签；错过今日窗口显示未签而非已签或失败", () => {
+  for (const [clock, text] of [["2026-10-25T00:01:00+08:00", "待签"], ["2026-10-25T09:31:00+08:00", "未签"]]) {
+    const f = fixture(undefined, new Map(), Date.parse(clock));
+    f.review.renderAccounts([{path: "synthetic.json", state: "active",
+      checkin: {date: "2026-10-24", status: "success", nextAt: 1900000000}}]);
+    const cell = cells(f.element("accountsTable").innerHTML)[11];
+    assert.match(cell, new RegExp(text));
+    assert(!cell.includes("已签") && !cell.includes(" · 计划 "));
+  }
+  audit("签到北京时间跨日通过", {old_success_cleared: true, missed_window_not_a_failure: true});
 });
 
 test("快照503保留上次内容，不生成零账号", async () => {

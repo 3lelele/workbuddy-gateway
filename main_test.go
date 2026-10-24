@@ -527,13 +527,13 @@ func TestIsAlreadyCheckedIn(t *testing.T) {
 
 func TestNextDailyCheckinUTC8(t *testing.T) {
 	loc := time.FixedZone("test", 8*60*60)
-	before := time.Date(2026, 9, 15, 8, 59, 0, 0, loc)
-	if got := nextDailyCheckin(before); !got.Equal(time.Date(2026, 9, 15, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))) {
-		t.Fatalf("before 09:00 got %v", got)
+	before := time.Date(2026, 9, 15, 7, 59, 0, 0, loc)
+	if got := nextDailyCheckin(before); !got.Equal(time.Date(2026, 9, 15, 8, 0, 0, 0, checkinZone)) {
+		t.Fatalf("before first window got %v", got)
 	}
 	after := time.Date(2026, 9, 15, 9, 1, 0, 0, loc)
-	if got := nextDailyCheckin(after); !got.Equal(time.Date(2026, 9, 16, 9, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))) {
-		t.Fatalf("after 09:00 got %v", got)
+	if got := nextDailyCheckin(after); !got.Equal(time.Date(2026, 9, 16, 8, 0, 0, 0, checkinZone)) {
+		t.Fatalf("without a pending account plan got %v", got)
 	}
 }
 
@@ -1036,10 +1036,13 @@ func TestRenderAccountTableUsesFullYearAndNoEmoji(t *testing.T) {
 		FreeModels:     1,
 		ModelCooldowns: 2,
 	}})
-	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "套餐", "免费模型", "模型冷却", "1100", "免费"} {
+	for _, want := range []string{"凭据文件", "workbuddy4.json", "国际站", "付费耗尽", "2027-09-05 01:36:55", "总额度", "已用", "剩余", "套餐", "签到", "模型冷却", "1100"} {
 		if !strings.Contains(table, want) {
 			t.Fatalf("table missing %q:\n%s", want, table)
 		}
+	}
+	if strings.Contains(table, "免费模型") {
+		t.Fatal("removed free-model column remains")
 	}
 	if strings.Contains(table, "说明") {
 		t.Fatalf("table should not contain removed description column:\n%s", table)
