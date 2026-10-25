@@ -419,8 +419,7 @@ func TestCheckinSnapshotAndTableShowTodayWithoutChangingModelLedger(t *testing.T
 		t.Fatal("reading status rewrote the schedule")
 	}
 	row := taskByID(t, taskViewDefinitions(), "daily_checkin")
-	if !strings.Contains(row.Schedule, "08:00–09:30") || !strings.Contains(row.Schedule, "09:30–10:00") ||
-		!strings.Contains(row.Schedule, "至少1分钟") || strings.Contains(row.Schedule, "事件可能提前触发") {
+	if row.Schedule != "每日上午随机时间签到" {
 		t.Fatalf("task page advertises old scheduling semantics: %s", row.Schedule)
 	}
 }

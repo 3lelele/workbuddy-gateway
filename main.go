@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version = "1.14.37"
+	version = "1.14.38"
 
 	// 状态快照文件名：serve 后台周期写入，monitor 前台命令实时读取展示
 	statusSnapshotFile = "workbuddy-status.json"
@@ -2854,11 +2854,49 @@ func fitCell(s string, width int) string {
 
 func renderAccountTable(accs []accountSnapshot) string {
 	now := time.Now()
-	widths := []int{4, 20, 24, 8, 10, 19, 10, 10, 10, 10, 10, 10}
-	for _, a := range accs {
-		widths[9] = min(36, max(widths[9], displayWidth(planDisplayLabel(a.PlanLabel, a.PlanStale))))
-	}
 	headers := []string{"序号", "凭据文件", "账号", "站点", "状态", "Token 有效期", "总额度", "已用", "剩余", "套餐", "签到", "模型冷却"}
+	// 列宽随当前数据收紧，只保留必要的表头与内容宽度。长账号/文件名仍有
+	// 上限，避免一个异常值把整张表撑得过宽。
+	caps := []int{4, 28, 36, 8, 10, 19, 12, 12, 12, 24, 6, 8}
+	rows := make([][]string, 0, len(accs))
+	for i, a := range accs {
+		status := "可用"
+		expires := "-"
+		total, used, remaining, plan := "-", "-", "-", "-"
+		if a.QuotaKnown {
+			total = formatQuotaAmount(a.QuotaUnlimited, "total", a.QuotaTotal)
+			used = formatQuotaAmount(a.QuotaUnlimited, "used", a.QuotaUsed)
+			remaining = formatQuotaAmount(a.QuotaUnlimited, "remaining", a.QuotaRemaining)
+			plan = planDisplayLabel(a.PlanLabel, a.PlanStale)
+		}
+		if a.TokenExpiresAt > 0 {
+			expires = time.Unix(a.TokenExpiresAt, 0).Format("2006-01-02 15:04:05")
+		}
+		switch a.State {
+		case "cooldown":
+			status = "冷却"
+		case "expired":
+			status = "已过期"
+		case "quota_exhausted", "paid_exhausted":
+			status = "付费耗尽"
+		case "disabled":
+			status = "失效"
+		}
+		rows = append(rows, []string{
+			strconv.Itoa(i + 1), filepath.Base(a.Path), ifEmpty(a.Nickname, "-"),
+			profileForEdition(a.Edition).Label, status, expires, total, used, remaining, plan,
+			checkinDisplay(a.Checkin, a.Edition, now), strconv.Itoa(a.ModelCooldowns),
+		})
+	}
+	widths := make([]int, len(headers))
+	for i, header := range headers {
+		widths[i] = displayWidth(header)
+	}
+	for _, cells := range rows {
+		for i, cell := range cells {
+			widths[i] = max(widths[i], min(caps[i], displayWidth(cell)))
+		}
+	}
 	border := func() string {
 		var b strings.Builder
 		b.WriteByte('+')
@@ -2883,34 +2921,8 @@ func renderAccountTable(accs []accountSnapshot) string {
 	b.WriteString(border() + "\n")
 	b.WriteString(row(headers) + "\n")
 	b.WriteString(border() + "\n")
-	for i, a := range accs {
-		status := "可用"
-		expires := "-"
-		total, used, remaining, plan := "-", "-", "-", "-"
-		if a.QuotaKnown {
-			total = formatQuotaAmount(a.QuotaUnlimited, "total", a.QuotaTotal)
-			used = formatQuotaAmount(a.QuotaUnlimited, "used", a.QuotaUsed)
-			remaining = formatQuotaAmount(a.QuotaUnlimited, "remaining", a.QuotaRemaining)
-			plan = planDisplayLabel(a.PlanLabel, a.PlanStale)
-		}
-		if a.TokenExpiresAt > 0 {
-			expires = time.Unix(a.TokenExpiresAt, 0).Format("2006-01-02 15:04:05")
-		}
-		switch a.State {
-		case "cooldown":
-			status = "冷却"
-		case "expired":
-			status = "已过期"
-		case "quota_exhausted", "paid_exhausted":
-			status = "付费耗尽"
-		case "disabled":
-			status = "失效"
-		}
-		b.WriteString(row([]string{
-			strconv.Itoa(i + 1), filepath.Base(a.Path), ifEmpty(a.Nickname, "-"),
-			profileForEdition(a.Edition).Label, status, expires, total, used, remaining, plan,
-			checkinDisplay(a.Checkin, a.Edition, now), strconv.Itoa(a.ModelCooldowns),
-		}) + "\n")
+	for _, cells := range rows {
+		b.WriteString(row(cells) + "\n")
 	}
 	b.WriteString(border())
 	for _, a := range accs {
@@ -3149,11 +3161,7 @@ func runServe() {
 		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 		os.Exit(1)
 	}
-	defer func() {
-		for _, listener := range listeners {
-			_ = listener.Close()
-		}
-	}()
+	gatewayServers.register(servers, listeners)
 	configCtx, stopConfigReload := context.WithCancel(context.Background())
 	defer stopConfigReload()
 	loadModelsCache()
@@ -3263,7 +3271,7 @@ func runServe() {
 		fmt.Printf("   模型黑白名单:  未启用 (%s 中 models 段可配置)\n", runtimeConfigFile)
 	}
 	fmt.Printf("   模型账号名单:  %d 个模型配置了凭据文件规则（%s）\n", modelAccountRuleCount(), runtimeConfigFile)
-	fmt.Println("   配置热生效:    每 1s 扫描 config.json；端口变更需重启")
+	fmt.Println("   配置热生效:    每 1s 扫描 config.json；监听端口可热切换，已有连接和流不受影响")
 
 	// 启动时展示所有账号状态（与 status 命令一致）
 	accountMu.Lock()
@@ -3306,13 +3314,7 @@ func runServe() {
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(stopChan)
 	serveErrors := make(chan error, len(servers))
-	for i := range servers {
-		go func(i int) {
-			if err := servers[i].Serve(listeners[i]); err != nil && err != http.ErrServerClosed {
-				serveErrors <- err
-			}
-		}(i)
-	}
+	gatewayServers.start(serveErrors)
 	select {
 	case <-stopChan:
 	case err := <-serveErrors:
@@ -3322,15 +3324,7 @@ func runServe() {
 	stopCheckin() // Stop scheduled writes before draining the HTTP listeners.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var shutdown sync.WaitGroup
-	for _, server := range servers {
-		shutdown.Go(func() {
-			if err := server.Shutdown(ctx); err != nil {
-				_ = server.Close()
-			}
-		})
-	}
-	shutdown.Wait()
+	gatewayServers.shutdown(ctx)
 	fmt.Println("网关已安全停止。")
 }
 

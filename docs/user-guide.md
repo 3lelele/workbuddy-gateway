@@ -12,9 +12,11 @@
 
 基于腾讯 **CodeBuddy** 协议开发的**纯 Go、零 CGO 依赖、跨平台单二进制**本地 AI 代理网关。默认无 Web UI，全部通过命令行（CLI）完成登录、凭据续期与服务控制；可选开启网页管理台（`-webui`，见下文）。
 
-**v1.14.0**：新增配置热生效、全局账号与模型网页开关、凭据 JSON 编辑、端口设置及日志保留/清理。旧配置缺省日志保留天数时不自动删除；端口修改仍需重启。请先升级二进制，再添加新增配置字段。
+**v1.14.0**：新增配置热生效、全局账号与模型网页开关、凭据 JSON 编辑、端口设置及日志保留/清理。旧配置缺省日志保留天数时不自动删除。请先升级二进制，再添加新增配置字段。
 
 **v1.14.1**：网页凭据页已移除，新增只读定时任务时间页；执行记录来自现有后端日志，无新增调度模块。高频任务日志按分钟汇总，状态变化即时记录。
+
+**v1.14.38**：网页运行状态与告警行紧凑展示，完整告警改为悬浮/触摸详情；日志最新行置顶，标签栏等分且在超 4K 屏幕封顶。CLI 账号表按内容收紧列宽。API/Web 端口支持热切换，保留已有连接与流；端口绑定或调试日志准备失败时保留旧运行状态，并修复状态查询与端口更新之间的数据竞态。
 
 **v1.14.24**：Chat 流式响应增加首字节前 SSE 心跳与最多一次安全重放；DSH 身份句和 GUI 环境说明扩展覆盖 assistant 历史、后续文本块及配置注入提示词。默认开启，可通过 `upstream` 配置关闭重放。
 
@@ -27,6 +29,8 @@
 **v1.14.28**：展示身份替换支持 `config.json` 的 `identity.enabled`、`identity.target` 和自定义 `identity.replacements`。
 
 **v1.14.29**：新用户首次启动自动生成包含完整 identity 映射的 `config.json`；旧配置缺少 identity 时自动补充并保留其他字段；identity 为空、字段省略或 target 为空时使用默认 WorkBuddy，不阻断启动。`replacements` 支持任意用户自定义词，例如 `"kimi": "WorkBuddy"`。
+
+**v1.14.38**：`gateway.apiPort` / `gateway.webPort` 也纳入热加载：全部新监听绑定成功后才切换，已有连接与流式响应继续完成。网页总览压缩运行状态高度、告警正文改为悬浮详情，移除统计落盘徽标和摘要卡装饰；运行日志最新行置顶，选项卡在 4K 及以下居中占屏宽 5/6，4K 以上宽度封顶。CLI 状态表按实际内容收紧列宽，超长账号与文件名仍会截断并保持对齐。
 
 **同时支持两个上游站点**（同一套 `/v2/plugin/*` 协议，凭据按站点隔离，账号池可混挂轮询）：
 
@@ -148,7 +152,7 @@ workbuddy-gateway serve -webui -allow-price-probes
 | `apiKeyEnabled` | `false` | 模型 API 是否校验 Key。关闭时不带 Key 或任意 Key 均可调用模型；开启时必须匹配 `apiKey` |
 | `apiKey` | `""` | 模型 API Key。开启校验时必须非空；关闭时保留原值，重新开启即可继续使用 |
 
-网页控制台也可在「访问设置」页切换 `apiKeyEnabled` 并设置 `apiKey`，保存后立即生效并写回本文件；端口修改需要重启。管理 Key 与模型 API Key **相互独立**：关闭模型 API 鉴权不会关闭管理鉴权，模型 API Key 也不能登录网页控制台。为避免他人抢先生成，**页面一键生成**管理 Key 只允许本机访问；**手动编辑 `config.json` 设置 `gateway.adminKey`** 不受此限制，效果与一键生成完全相同。
+网页控制台也可在「访问设置」页切换 `apiKeyEnabled` 并设置 `apiKey`，保存后立即生效并写回本文件。`gateway.apiPort` / `gateway.webPort` 也支持热切换：先校验并绑定新端口，再关闭旧监听；已有连接和正在输出的流不主动中断。管理 Key 与模型 API Key **相互独立**：关闭模型 API 鉴权不会关闭管理鉴权，模型 API Key 也不能登录网页控制台。为避免他人抢先生成，**页面一键生成**管理 Key 只允许本机访问；**手动编辑 `config.json` 设置 `gateway.adminKey`** 不受此限制，效果与一键生成完全相同。
 
 > **升级顺序（重要）**：新版本能读取不含 `gateway` 段的旧配置，但**旧版本二进制遇到含 `gateway` 段的新配置会启动失败**（`json: unknown field "gateway"`）。请**先替换二进制、再添加 `gateway` 配置**。
 
@@ -390,11 +394,15 @@ workbuddy-gateway serve -keepalive-hours ""
 |---|---|
 | 模型名单、`models.accounts`（含 `all`） | 热生效，控制后续调度 |
 | `gateway.adminKey` / `apiKeyEnabled` / `apiKey` | 热生效；管理 Key 改变后需使用新 Key 登录 |
+| `concurrent.MaxAcc` / `MaxGlobal` | 热生效；新请求立即按新并发上限排队，已有请求不中断 |
 | `systemPrompt` / `identity` / `debug.enabled` / `debug.fullRequests` | 热生效；仅影响后续请求 |
+| `logs.retentionDays` | 热生效；下一次清理调度立即使用新保留天数 |
 | `upstream` 超时、网络重试次数 | 后续上游请求使用新值；已有流式响应保持原空闲超时 |
-| `gateway.apiPort` / `webPort` | 写入配置但**重启后**变更监听；页面仍显示实际监听端口 |
+| `gateway.apiPort` / `webPort` | **立即热切换**监听；新端口全部绑定成功后才关闭旧监听，已有连接与流继续完成 |
 
 - 配置先整体解析、校验，再应用。运行时遇到半写 JSON、空文件、文件短暂缺失、错误类型或非法账号路径时，**保留上一份有效配置**，错误原因写入 `logs/gateway-YYYY-MM-DD.log`。修正并保存后自动重试；不会把配置读取失败误当作“全部开启”。
+- 新端口被占用或调试日志文件无法打开时，整次热更新被拒绝；原监听、鉴权及调试开关保持原状。网页保存失败会尝试恢复旧配置文件；直接编辑文件失败则保留原运行状态，等待文件修正。API / Web 两个现有端口不能直接互换，需先借用第三个空闲端口。
+- 热加载范围是 `config.json` 支持的字段，不包括命令行启动参数（如 `-addr`、`-webui`、`-reload-interval`、`-models-refresh`、`-keepalive-hours`）。显式 `-port` 优先级仍高于 `gateway.apiPort`；修改 Web 端口后请使用新端口重新打开控制台。
 - 要恢复默认规则，请保存有效的 `{}` 或将对应列表设为 `[]`，而不是删除运行中的配置文件。
 - 上一版本省略 `all`、`accounts`、`models` 或 `gateway` 的配置仍可读取；`accounts: {}`、`accounts: null`、`all: {}` 和空名单均表示无全局限制。默认示例包含空的 `models.accounts.all.allowlist/blocklist`。
 - 首次启动且没有 `config.json` 时，程序会按内置示例生成完整默认配置。旧配置缺少 `identity` 段时，启动阶段只补充该段，其他字段原样保留；`identity` 为空、`target` 为空或 `replacements` 为空时按默认 WorkBuddy 规则运行，不会阻断启动。用户自定义的 `replacements` 键不限于内置 Harness 名称。
@@ -809,10 +817,10 @@ systemctl restart workbuddy-gateway
 - 倍率来源只读 `GET /admin/api/rate-detail`（需管理 Key，仅支持 GET），复用定时任务页的日志读取方式：扫描 `logs/gateway-*.log` 尾部并解析，不新增调度器、状态文件或内存账本；结果缓存 20 秒，点击时按需拉取，不随总览轮询反复扫描。
 - 解析的日志来源：`[Models] 官方倍率`（官方目录首次或变化时记录）、`[ModelPrice]`（探测结论，含缓存载入）、`[ModelCost]`（正常请求实测）。优先级与页面取值顺序一致：正常请求实测免费 > 探测免费 > 探测收费 > 促销过期 > 官方数值。
 - 价格相关日志全部写入**普通日志**（`logs/gateway-YYYY-MM-DD.log`），不依赖 `debug.enabled`；调试日志关闭时这些记录仍然存在。日志只记录模型名、站点、倍率、credits、促销时间与账号文件名，不记录令牌。
-- 「访问设置」可编辑 `gateway.apiPort` / `gateway.webPort`，保存调用原来的 `POST /admin/api/settings`。配置端口与实际监听端口分别显示，修改后**需重启网关**，不会直接中断当前页面或流式请求；显式 `-port` 仍优先于配置。
+- 「访问设置」可编辑 `gateway.apiPort` / `gateway.webPort`，保存调用原来的 `POST /admin/api/settings`。配置端口与实际监听端口分别显示，修改后**立即热切换**；新监听全部绑定成功后才关闭旧监听，已有连接和流式请求不会被主动中断。页面本身若在旧 Web 端口打开，需用新端口重新打开；显式 `-port` 仍优先于配置。
 - 「配置」页点击「编辑配置」后先展示风险警告，确认后通过 `GET /admin/api/config-edit?acknowledged=1` 加载真实原文（包含 Key）；仅通过可信网络、HTTPS 或 SSH 转发使用。编辑器不把正文保存到浏览器存储，离开配置页、退出编辑或会话失效时清除原文，未保存修改需确认丢弃。
 - 「校验并保存」通过 `POST /admin/api/config-edit` 提交 `content`、读取时的 SHA-256 `revision` 和 `acknowledged: true`。配置最大 1 MiB，必须是符合既有字段及类型规则的单个 JSON 对象；拒绝将 `[REDACTED]` 当作 Key。读取后被其他网页操作或服务器修改过的配置返回 `409`，不覆盖新版本；网页保留输入供核对，重新加载前提示丢弃未保存修改。
-- 保存完整配置等效于直接修改服务器文件：可热配置立即生效，监听端口保持不变直到重启；日志保留规则可能触发不可撤销的删除。管理 Key 改变后退出旧会话、要求重新登录；清空管理 Key 需额外确认并提交 `confirmAdminKeyRemoval: true`，之后需在服务器本机重新设置。配置写入或热应用失败会尽力恢复旧文件，日志只记录阶段、结果和长度，不记录正文或 Key。
+- 保存完整配置等效于直接修改服务器文件：`config.json` 内的全部字段都会热应用，包括监听端口；日志保留规则可能触发不可撤销的删除。管理 Key 改变后退出旧会话、要求重新登录；清空管理 Key 需额外确认并提交 `confirmAdminKeyRemoval: true`，之后需在服务器本机重新设置。配置写入、端口绑定或热应用失败会尽力恢复旧文件与旧监听，日志只记录阶段、结果和长度，不记录正文或 Key。
 - 「日志」页通过 `GET/POST /admin/api/log-settings` 读写 `logs.retentionDays`，通过 `POST /admin/api/log-cleanup`（空 JSON 对象）清理过期日志，返回删除数量、回收字节、正在写入跳过数量与失败数量。
 - 所有新接口均需要独立管理 Key，并复用同源校验和 TraceID 落盘审计；模型 API Key 不能编辑凭据、修改端口或清理日志。
 
