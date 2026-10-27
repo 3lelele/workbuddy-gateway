@@ -40,6 +40,15 @@ node --test tests/web/app.test.cjs
 
 `tests/web/app.test.cjs` 加载真实 `web/app.js`，使用合成 DOM / fetch 响应，不需要浏览器依赖、不调用生产接口。审计写入 `logs/webui-frontend-tests-dev-YYYY-MM-DD.jsonl`。
 
+可选真实浏览器回归需要 Python Playwright 和可用 Chromium，不纳入默认测试入口：
+
+```bash
+python tests/web/polling.browser.py
+python tests/web/polling.browser.py --browser "本机 Chromium 兼容浏览器的可执行文件路径"
+```
+
+该测试只加载仓库中的网页文件，将所有网络请求拦截为合成响应，验证成功/错误提示、页面位移、账号启停、表格局部更新、倍率详情保留及图表复用；不访问生产或上游，验收记录写入 `logs/polling-flicker-*.jsonl`。
+
 ## 构建脚本
 
 ```powershell

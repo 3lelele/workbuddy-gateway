@@ -62,8 +62,16 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 	identityEnabled := true
 	exampleSchema.Identity = runtimeIdentityConfig{Enabled: &identityEnabled, Target: "WorkBuddy", Replacements: map[string]string{
 		"Claude Code": "WorkBuddy", "Claude": "WorkBuddy", "DeepSeek Harness": "WorkBuddy",
-		"Codex": "WorkBuddy", "ZCode": "WorkBuddy",
+		"Codex": "WorkBuddy", "ZCode": "WorkBuddy", "workspace root": "workspace base",
+		"are paths the user": "are paths that the user",
 	}}
+	compatibilityEnabled := true
+	exampleSchema.PromptCompatibility = runtimePromptCompatibilityConfig{
+		Enabled: &compatibilityEnabled,
+		Replacements: map[string]string{
+			"workspace root": "workspace base",
+		},
+	}
 	schema, err := json.Marshal(exampleSchema)
 	if err != nil {
 		t.Fatal(err)
@@ -118,6 +126,26 @@ func TestConfigExampleStartsFreshDeployment(t *testing.T) {
 	}
 	if currentAdminKey() != "" || currentAPIKey() != "" {
 		t.Fatal("示例配置不应预置任何 Key")
+	}
+}
+
+func TestConfigExampleIncludesIdentityCompatibilityDefaults(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c runtimeFileConfig
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	for old, want := range map[string]string{
+		"workspace root":     "workspace base",
+		"are paths the user": "are paths that the user",
+	} {
+		if c.Identity.Replacements[old] != want {
+			t.Fatalf("config.example identity replacement %q=%q want %q",
+				old, c.Identity.Replacements[old], want)
+		}
 	}
 }
 
