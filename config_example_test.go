@@ -14,6 +14,17 @@ import (
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
+	// Cross-compiled test binaries may run without their original build path.
+	// The deployment preflight supplies a private, extracted source snapshot.
+	if root := os.Getenv("WORKBUDDY_TEST_SOURCE_ROOT"); root != "" {
+		if !filepath.IsAbs(root) {
+			t.Fatal("WORKBUDDY_TEST_SOURCE_ROOT must be absolute")
+		}
+		if info, err := os.Stat(filepath.Join(root, "go.mod")); err != nil || !info.Mode().IsRegular() {
+			t.Fatal("WORKBUDDY_TEST_SOURCE_ROOT must contain the test source tree")
+		}
+		return root
+	}
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate source file")
@@ -65,7 +76,7 @@ func TestConfigExampleCoversEveryRuntimeField(t *testing.T) {
 		"Codex": "WorkBuddy", "ZCode": "WorkBuddy", "workspace root": "workspace base",
 		"are paths the user": "are paths that the user",
 	}}
-	compatibilityEnabled := true
+	compatibilityEnabled := false
 	exampleSchema.PromptCompatibility = runtimePromptCompatibilityConfig{
 		Enabled: &compatibilityEnabled,
 		Replacements: map[string]string{
@@ -137,6 +148,12 @@ func TestConfigExampleIncludesIdentityCompatibilityDefaults(t *testing.T) {
 	var c runtimeFileConfig
 	if err := json.Unmarshal(raw, &c); err != nil {
 		t.Fatal(err)
+	}
+	if c.PromptCompatibility.Enabled == nil || *c.PromptCompatibility.Enabled {
+		t.Fatal("example must not enable the independent compatibility module")
+	}
+	if len(c.Identity.Replacements) != 7 {
+		t.Fatalf("example identity rules=%d want=7", len(c.Identity.Replacements))
 	}
 	for old, want := range map[string]string{
 		"workspace root":     "workspace base",

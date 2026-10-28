@@ -73,10 +73,10 @@ type runtimeFileConfig struct {
 		Force    string `json:"force"`
 	} `json:"systemPrompt"`
 	// Identity 控制 system/developer/assistant 中的展示身份替换。
-	// 省略时保持旧行为：已知 Harness 名称替换为 Assistant。
+	// 省略时使用内置 WorkBuddy 展示名及默认文本规则。
 	Identity runtimeIdentityConfig `json:"identity"`
-	// PromptCompatibility 控制上游渠道校验词的等义替换。
-	// 独立于 identity，便于上游新增黑名单词时只改配置、不发版。
+	// PromptCompatibility 是显式启用的独立文本规则；默认关闭，
+	// 不会在 identity 关闭或自定义替换时偷偷启用额外改写。
 	PromptCompatibility runtimePromptCompatibilityConfig `json:"promptCompatibility"`
 	Concurrent          concurrentFileConfig             `json:"concurrent"`
 	Debug               debugFileConfig                  `json:"debug"`

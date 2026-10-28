@@ -658,8 +658,13 @@ func main() {
 	defer closeLog()
 	if serveCommand || command == "probe" {
 		// Config is loaded before logging is initialized. Persist its effective
-		// concurrency limits now as well, rather than leaving them console-only.
-		logConcurrentConfig(newTraceID())
+		// runtime settings now as well, rather than leaving them console-only.
+		trace := newTraceID()
+		logConcurrentConfig(trace)
+		identityEnabled, identityTarget, identityRules := identitySettingsSummary()
+		compatibilityEnabled, compatibilityRules := promptCompatibilitySettingsSummary()
+		log.Printf("[配置就绪] traceId=%s identity启用=%t identity目标=%s identity规则数=%d 独立兼容启用=%t 独立兼容规则数=%d 说明=启动配置已加载，后续修改可热加载；未记录Key或配置正文",
+			trace, identityEnabled, identityTarget, identityRules, compatibilityEnabled, compatibilityRules)
 	}
 	closeDebug := func() {}
 	if serveCommand {

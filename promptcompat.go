@@ -28,8 +28,8 @@ type promptCompatibilitySettings struct {
 	rules   []promptCompatibilityRule
 }
 
-// 2026-10-27 实测：DSH system 中这一句会触发国内站 400/11128；
-// 等义改为 workspace base 后同一报文返回 200。保留可配置覆盖能力。
+// Optional wording rules. They require explicit opt-in and do not guarantee
+// acceptance by any upstream policy. Default rewrites belong to identity.
 var defaultPromptCompatibilityReplacements = map[string]string{
 	"workspace root": "workspace base",
 }
@@ -44,7 +44,7 @@ func defaultPromptCompatibilitySettings() promptCompatibilitySettings {
 }
 
 func defaultPromptCompatibilityConfig() runtimePromptCompatibilityConfig {
-	enabled := true
+	enabled := false
 	replacements := make(map[string]string, len(defaultPromptCompatibilityReplacements))
 	for old, newValue := range defaultPromptCompatibilityReplacements {
 		replacements[old] = newValue
@@ -53,7 +53,7 @@ func defaultPromptCompatibilityConfig() runtimePromptCompatibilityConfig {
 }
 
 func buildPromptCompatibilitySettings(c runtimePromptCompatibilityConfig) promptCompatibilitySettings {
-	enabled := true
+	enabled := false
 	if c.Enabled != nil {
 		enabled = *c.Enabled
 	}

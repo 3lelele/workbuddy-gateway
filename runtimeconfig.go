@@ -127,13 +127,6 @@ func ensureRuntimeConfigFile(path string) error {
 		}
 		changed = changed || updated
 	}
-	if !hasKey(doc, "promptCompatibility") {
-		doc["promptCompatibility"], err = json.Marshal(defaultPromptCompatibilityConfig())
-		if err != nil {
-			return err
-		}
-		changed = true
-	}
 	if !hasKey(doc, "concurrent") {
 		doc["concurrent"], _ = json.Marshal(normalizeConcurrentConfig(concurrentFileConfig{}))
 		changed = true
@@ -189,7 +182,7 @@ func ensureRuntimeConfigFile(path string) error {
 	if err := os.Rename(temporary, path); err != nil {
 		return err
 	}
-	log.Printf("[配置初始化] 已补充缺失的 identity/promptCompatibility/concurrent 默认配置；已有值和其他配置保留，后续修改仍可热加载")
+	log.Printf("[配置初始化] 已补充缺失的 identity/concurrent 默认配置；已有值和其他配置保留，后续修改仍可热加载；不自动添加或启用独立兼容模块")
 	return nil
 }
 
@@ -237,7 +230,7 @@ func ensureIdentityDefaultReplacements(doc map[string]json.RawMessage) (bool, er
 	} else {
 		var replacements map[string]string
 		if json.Unmarshal(identity[replacementsKey], &replacements) != nil {
-			return false, nil // 非法或 null 值交给完整配置校验，不擅自覆盖。
+			return false, nil // 非法类型交给完整配置校验，不擅自覆盖。
 		}
 		// A non-empty custom map disables runtime defaults, so merge every missing
 		// built-in rule while never overwriting an explicitly customized value.

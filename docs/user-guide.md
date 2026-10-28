@@ -342,7 +342,7 @@ workbuddy-gateway serve -keepalive-hours ""
 }
 ```
 
-- `promptCompatibility` 是独立的上游渠道词兼容列表，同样只处理 system/developer/assistant 文本；省略或空映射时使用内置 `workspace root → workspace base`，`enabled:false` 可关闭。它与 `identity` 均支持热加载，用户、工具定义和工具参数不会被改写。
+- `promptCompatibility` 是可选的独立文本规则，**默认关闭，旧配置升级不自动添加或开启**。只有显式 `enabled:true` 才执行；开启后省略或空映射使用内置词组规则。它与 `identity` 分别控制、均支持热加载；用户、工具定义和工具参数不会被改写。通常只使用 `identity` 即可，不必同时开启两套规则。
 
 | 字段 | 说明 |
 |---|---|

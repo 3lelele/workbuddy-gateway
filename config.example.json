@@ -24,7 +24,7 @@
     }
   },
   "promptCompatibility": {
-    "enabled": true,
+    "enabled": false,
     "replacements": {
       "workspace root": "workspace base"
     }
